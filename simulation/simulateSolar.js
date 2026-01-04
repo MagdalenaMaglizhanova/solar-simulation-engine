@@ -10,100 +10,155 @@ async function runSimulation() {
 
   const db = admin.firestore();
 
-  // 1. Вземаме данни от времето
-  const city = "Plovdiv";
-  const weatherRes = await fetch(`https://api.weatherapi.com/v1/current.json?key=${process.env.WEATHER_API_KEY}&q=${city}`);
-  const weatherData = await weatherRes.json();
+  // 🔹 ДЕБЪГ: Проверка на API ключа
+  console.log("API Key exists:", !!process.env.WEATHER_API_KEY);
   
-  const cloudCover = weatherData.current.cloud || 0; // проценти облаци
-  const sunFactor = (100 - cloudCover) / 100;        // 1.0 = пълно слънце, 0 = облачно
+  if (!process.env.WEATHER_API_KEY) {
+    console.error("❌ Missing WEATHER_API_KEY in environment variables!");
+    // Можеш да продължиш със симулация без API
+    return runFallbackSimulation(db);
+  }
 
-  // 2. Соларна мощност според времето + време на деня
+  let cloudCover = 0;
+  let sunFactor = 1;
+  
+  try {
+    // 1. Вземаме данни от времето
+    const city = "Plovdiv";
+    const weatherRes = await fetch(`https://api.weatherapi.com/v1/current.json?key=${process.env.WEATHER_API_KEY}&q=${city}`);
+    
+    // 🔹 ДЕБЪГ: Проверка на статуса
+    console.log("API Status:", weatherRes.status, weatherRes.statusText);
+    
+    if (!weatherRes.ok) {
+      throw new Error(`API returned ${weatherRes.status}: ${weatherRes.statusText}`);
+    }
+    
+    const weatherData = await weatherRes.json();
+    
+    // 🔹 ДЕБЪГ: Виж пълния отговор
+    console.log("Full API Response structure:", Object.keys(weatherData));
+    if (weatherData.current) {
+      console.log("Current data keys:", Object.keys(weatherData.current));
+    }
+    
+    // 🔹 ПРАВИЛНО ИЗВЛИЧАНЕ НА ОБЛАЧНОСТТА
+    // Пробвай различни варианти, тъй като API може да се е променил
+    if (weatherData.current.cloud !== undefined) {
+      cloudCover = weatherData.current.cloud;
+    } else if (weatherData.current.condition && weatherData.current.condition.code) {
+      // Ако има condition код, превърни го в облачност
+      const conditionCode = weatherData.current.condition.code;
+      cloudCover = estimateCloudCoverFromCondition(conditionCode);
+    } else {
+      // Fallback
+      cloudCover = 30;
+      console.warn("⚠️ Could not find cloud data, using fallback 30%");
+    }
+    
+    sunFactor = (100 - cloudCover) / 100;
+    
+    console.log(`✅ Weather data: ${cloudCover}% cloud cover, sun factor: ${sunFactor}`);
+
+  } catch (error) {
+    console.error(`❌ Error fetching weather: ${error.message}`);
+    // Fallback стойности
+    cloudCover = 30;
+    sunFactor = 0.7;
+  }
+
+  // 2. Соларна мощност според времето
+  const maxSolarPower = 1000; // W за целия панел
+  const solarPower = Math.floor(maxSolarPower * sunFactor);
+
+  // 3. Симулираме батерията
+  let lastBatteryCharge = 75; // default 75% (по-реалистично)
+  
+  try {
+    const lastDocSnapshot = await db.collection("solarData").orderBy("timestamp", "desc").limit(1).get();
+    if (!lastDocSnapshot.empty) {
+      lastBatteryCharge = lastDocSnapshot.docs[0].data().batteryCharge || 75;
+    }
+  } catch (error) {
+    console.warn(`⚠️ Error reading last data: ${error.message}`);
+  }
+
+  const loadPower = 300; // текущо включени уреди W
+  
+  // 🔹 КОРИГИРАНО: Промяна на батерията за 15 минути (0.25 часа)
+  const batteryDelta = (solarPower - loadPower) * 0.25; // Wh за 15 минути
+  let newBatteryCharge = Math.min(100, Math.max(20, lastBatteryCharge + batteryDelta));
+
+  // 4. Запис в Firestore
+  await db.collection("solarData").add({
+    city: "Plovdiv",
+    powerW: solarPower,
+    energyWh: solarPower * 0.25, // Произведена енергия за 15 минути
+    batteryCharge: newBatteryCharge,
+    cloudCover,
+    timestamp: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  console.log("✅ Simulation completed, data saved to Firestore");
+  console.log(`📊 Stats: ${solarPower}W solar, ${newBatteryCharge}% battery, ${cloudCover}% clouds`);
+}
+
+// Помощна функция за превръщане на condition код в облачност
+function estimateCloudCoverFromCondition(conditionCode) {
+  // Примерни стойности според weatherapi.com condition codes
+  const cloudMap = {
+    1000: 0,   // Sunny
+    1003: 30,  // Partly cloudy
+    1006: 70,  // Cloudy
+    1009: 90,  // Overcast
+    1030: 40,  // Mist
+    1063: 50,  // Patchy rain possible
+    // Добави повече кодове според нуждите
+  };
+  
+  return cloudMap[conditionCode] || 50; // Default 50% ако не разпознаем
+}
+
+// Fallback симулация без API
+async function runFallbackSimulation(db) {
+  console.log("🔄 Running fallback simulation (no weather API)");
+  
   const now = new Date();
   const hour = now.getHours();
   const isDaytime = hour >= 6 && hour <= 20;
   
-  let maxSolarPower = 0;
-  if (isDaytime) {
-    // Синусова крива: пик в обяд (12:00)
-    const solarHour = (hour - 6) / 14; // 0-1 през деня
-    const solarPosition = Math.sin(solarHour * Math.PI); // 0 в 6:00 и 20:00, 1 в 13:00
-    maxSolarPower = Math.floor(1000 * solarPosition * sunFactor);
-  } else {
-    // Нощем почти няма слънчева мощност
-    maxSolarPower = Math.floor(50 * sunFactor); // минимална мощност
+  // Симулация без API
+  const solarPower = isDaytime ? 
+    Math.floor(500 + Math.random() * 400) : // 500-900W през ден
+    Math.floor(Math.random() * 100);       // 0-100W нощем
+  
+  let lastBatteryCharge = 75;
+  
+  try {
+    const lastDocSnapshot = await db.collection("solarData").orderBy("timestamp", "desc").limit(1).get();
+    if (!lastDocSnapshot.empty) {
+      lastBatteryCharge = lastDocSnapshot.docs[0].data().batteryCharge || 75;
+    }
+  } catch (error) {
+    console.warn(`⚠️ Error reading last data: ${error.message}`);
   }
 
-  const solarPower = Math.max(0, maxSolarPower);
+  const loadPower = 300;
+  const batteryDelta = (solarPower - loadPower) * 0.25;
+  let newBatteryCharge = Math.min(100, Math.max(20, lastBatteryCharge + batteryDelta));
 
-  // 3. Симулираме батерията - КОРИГИРАНО ИЗЧИСЛЕНИЕ
-  const lastDocSnapshot = await db.collection("solarData").orderBy("timestamp", "desc").limit(1).get();
-  let lastBatteryCharge = 75; // default 75% (не 50!)
-  
-  if (!lastDocSnapshot.empty) {
-    lastBatteryCharge = lastDocSnapshot.docs[0].data().batteryCharge || 75;
-  }
-
-  // Консумация според времето на деня
-  const baseLoadPower = 200; // базов товар (всекидневни устройства)
-  const daytimeLoadBonus = isDaytime ? 300 : 0; // повече консумация през деня
-  const loadPower = baseLoadPower + daytimeLoadBonus;
-
-  // Батериен капацитет: 10 kWh = 10000 Wh
-  const BATTERY_CAPACITY_WH = 10000;
-  
-  // Изчисляваме промяната за интервал от 15 минути (0.25 часа)
-  const timeIntervalHours = 0.25; // 15 минути = 0.25 часа
-  
-  // Нетна мощност (положителна = зареждане, отрицателна = разреждане)
-  const netPowerW = solarPower - loadPower;
-  
-  // Енергийна промяна в Wh
-  const energyDeltaWh = netPowerW * timeIntervalHours;
-  
-  // Нова енергия в батерията (Wh)
-  const currentEnergyWh = (lastBatteryCharge / 100) * BATTERY_CAPACITY_WH;
-  const newEnergyWh = Math.max(0, Math.min(BATTERY_CAPACITY_WH, currentEnergyWh + energyDeltaWh));
-  
-  // Нов заряд в проценти
-  let newBatteryCharge = Math.round((newEnergyWh / BATTERY_CAPACITY_WH) * 100);
-  
-  // 🔹 ВАЖНО: Никога не позволявай да падне под 20% (реалистично)
-  newBatteryCharge = Math.max(20, newBatteryCharge);
-
-  // 4. Обща произведена енергия (симулирана)
-  const energyWh = solarPower > 0 ? 
-    Math.floor(2000 + Math.random() * 1000) : // Ден
-    Math.floor(1800 + Math.random() * 500);   // Нощ
-
-  // 5. Допълнителни реалистични данни
-  const solarVoltage = 220 + Math.random() * 20;
-  const batteryVoltage = 48 + Math.random() * 4;
-
-  // 6. Запис в Firestore
   await db.collection("solarData").add({
-    city,
+    city: "Plovdiv",
     powerW: solarPower,
-    energyWh: energyWh,
+    energyWh: solarPower * 0.25,
     batteryCharge: newBatteryCharge,
-    solarVoltage: solarVoltage,
-    batteryVoltage: batteryVoltage,
-    loadPowerW: loadPower,
-    cloudCover,
-    isDaytime,
+    cloudCover: isDaytime ? 40 : 80,
+    isDaytime: isDaytime,
     hour: hour,
-    timestamp: new Date()
+    timestamp: admin.firestore.FieldValue.serverTimestamp()
   });
 
-  console.log("🌤️ =================================");
-  console.log(`🕒 Време: ${now.toLocaleTimeString('bg-BG')}`);
-  console.log(`🌥️  Облачност: ${cloudCover}% (Слънчев фактор: ${sunFactor.toFixed(2)})`);
-  console.log(`☀️  Соларна мощност: ${solarPower}W`);
-  console.log(`💡 Консумация: ${loadPower}W`);
-  console.log(`🔋 Батерия: ${lastBatteryCharge}% → ${newBatteryCharge}%`);
-  console.log(`📊 Нетна мощност: ${netPowerW > 0 ? '+' : ''}${netPowerW}W`);
-  console.log(`🌙 Ден/Нощ: ${isDaytime ? '☀️ Ден' : '🌙 Нощ'}`);
-  console.log("✅ Данните са записани във Firestore");
+  console.log(`✅ Fallback simulation: ${solarPower}W, ${newBatteryCharge}% battery`);
 }
 
 runSimulation().catch(err => {
